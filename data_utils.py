@@ -1,0 +1,399 @@
+"""
+In-app data loading + bucket assignment.
+
+Bucket assignment rule (applied in this order, first match wins):
+  1. followup_status == 'Closed'                 -> 'Closed'
+  2. followup_status == 'Freeze'                 -> 'SFC'
+  3. followup_status == 'Not Responding'
+       AND refer_to in {CCD, blank}              -> 'Not Responding'
+                                                    (sub: 'First Miss' if no_of_follow_up <= 1
+                                                          'Red Zone'   if no_of_follow_up >  1)
+  4. followup_status == 'Not Responding'
+       AND refer_to is some other dept           -> that dept's bucket  (their headache)
+  5. refer_to == 'CCD'                           -> 'CCD-Joined'
+  6. refer_to == 'CSM' / 'Treasurer' / 'SFC' / 'SDC' -> that dept's bucket
+  7. refer_to is blank/NaN  AND followup_status is blank -> dropped (NA per user, not yet contacted)
+
+Buckets used for KPI tiles:
+    BUCKET_ORDER = [Total Missing, CCD-Joined, CSM, Treasurer, SFC, SDC,
+                    Not Responding, Closed]
+"""
+
+from __future__ import annotations
+
+import io
+import re
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+
+# Threshold (in % absent per course) above which a course is flagged "at risk".
+# Mirrors the prior dashboard's tuning.
+COURSE_AT_RISK_PCT = 22
+
+RISK_LEVEL_ORDER = {"No Data": 0, "Safe Zone": 1, "Low Risk": 2, "At Risk": 3, "High Risk": 4}
+RISK_COLORS = {
+    "Safe Zone": "#16a34a",   # green
+    "Low Risk":  "#eab308",   # yellow
+    "At Risk":   "#f97316",   # orange
+    "High Risk": "#dc2626",   # red
+    "No Data":   "#475569",   # gray
+}
+
+
+BUCKET_ORDER = [
+    "CCD-Joined",
+    "CSM",
+    "Treasurer",
+    "SFC",
+    "SDC",
+    "Not Responding",
+    "Closed",
+    "Pending Contact",
+]
+
+DEPARTMENT_BUCKETS = ["CCD-Joined", "CSM", "Treasurer", "SFC", "SDC"]
+FORWARDED_BUCKETS = ["CSM", "Treasurer", "SFC", "SDC"]   # for Tab-2 "Forwarded" tile
+
+STATUS_COLORS = {
+    "CCD-Joined":      "#16a34a",  # green
+    "CSM":             "#0ea5e9",  # sky
+    "Treasurer":       "#f59e0b",  # amber
+    "SFC":             "#a855f7",  # violet
+    "SDC":             "#ef4444",  # red
+    "Not Responding":  "#dc2626",  # darker red
+    "Closed":          "#64748b",  # slate
+    "Pending Contact": "#475569",  # dark gray
+}
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+
+def load_long_csv(source) -> pd.DataFrame:
+    """Read cleaned/long.csv and run post-load enrichment.
+
+    Intentionally NOT cached: @st.cache_data only invalidates when this
+    function's own source changes, not when downstream helpers like
+    _post_load / parse_course_attendance change. Stale cache silently
+    served wrong risk numbers after parser tweaks. The data is small
+    (a few hundred rows), so re-reading is cheap.
+    """
+    if hasattr(source, "read"):
+        df = pd.read_csv(source, dtype={"student_id": str, "phone": str})
+    else:
+        df = pd.read_csv(Path(source), dtype={"student_id": str, "phone": str})
+    return _post_load(df)
+
+
+def load_long_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """For when ingest.py is called inline and a DataFrame is already in memory."""
+    return _post_load(df.copy())
+
+
+def _post_load(df: pd.DataFrame) -> pd.DataFrame:
+    # normalise types
+    if "no_of_follow_up" in df.columns:
+        df["no_of_follow_up"] = (
+            pd.to_numeric(df["no_of_follow_up"], errors="coerce").fillna(0).astype(int)
+        )
+    for c in ("refer_to", "followup_status", "last_followup", "reason", "remarks"):
+        if c in df.columns:
+            df[c] = df[c].apply(lambda v: v.strip() if isinstance(v, str) else v)
+
+    df["bucket"] = df.apply(_assign_bucket, axis=1)
+    df["red_zone"] = (
+        (df["bucket"] == "Not Responding") & (df["no_of_follow_up"] > 1)
+    )
+
+    # Course-wise risk (parsed from attendance_current — already normalized in ingest).
+    df = _enrich_with_course_risk(df)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Course-wise attendance + risk classification
+# ---------------------------------------------------------------------------
+
+# matches "ACC-410-A 6/28 12-FEB-26" (date is optional — sometimes the export
+# omits the last-attended date when there's been no attendance at all, e.g.
+# "ENG-205-A 1/1" or "MKT-407-A 3/3")
+_COURSE_ENTRY_RE = re.compile(
+    r"^([A-Z]+-\d+[A-Z]?-[A-Z])\s+(\d+)\s*/\s*(\d+)(?:\s+([\d\-A-Za-z]+))?\s*$"
+)
+
+
+def parse_course_attendance(s) -> list[dict]:
+    """Parse 'CODE-SEC absent/total date' entries (comma- or newline-separated)."""
+    if pd.isna(s) or not str(s).strip():
+        return []
+    out: list[dict] = []
+    for raw in re.split(r"[,\n]+", str(s)):
+        entry = raw.strip().rstrip(",")  # tolerate trailing commas
+        if not entry:
+            continue
+        m = _COURSE_ENTRY_RE.match(entry)
+        if not m:
+            continue
+        code = m.group(1)
+        absent, total = int(m.group(2)), int(m.group(3))
+        date = m.group(4) or ""
+        pct = round((absent / total) * 100, 1) if total else 0.0
+        out.append({"course": code, "absent": absent, "total": total,
+                    "absent_pct": pct, "last_attended": date})
+    return out
+
+
+def classify_course_risk(courses: list[dict]) -> tuple[str, int, int]:
+    """Return (category, n_courses_at_risk, n_courses_total)."""
+    if not courses:
+        return ("No Data", 0, 0)
+    total = len(courses)
+    at_risk = sum(1 for c in courses if c["absent_pct"] > COURSE_AT_RISK_PCT)
+    if at_risk == 0:
+        cat = "Safe Zone"
+    elif at_risk == total:
+        cat = "High Risk"
+    elif at_risk / total >= 0.5:
+        cat = "At Risk"
+    else:
+        cat = "Low Risk"
+    return (cat, at_risk, total)
+
+
+def _enrich_with_course_risk(df: pd.DataFrame) -> pd.DataFrame:
+    if "attendance_current" not in df.columns:
+        df["risk_category"] = "No Data"
+        df["courses_at_risk"] = 0
+        df["total_courses"] = 0
+        df["course_attendance_summary"] = pd.NA
+        return df
+
+    parsed = df["attendance_current"].apply(parse_course_attendance)
+    risks = parsed.apply(classify_course_risk)
+
+    df["risk_category"]   = risks.apply(lambda t: t[0])
+    df["courses_at_risk"] = risks.apply(lambda t: t[1])
+    df["total_courses"]   = risks.apply(lambda t: t[2])
+    df["risk_level"]      = df["risk_category"].map(RISK_LEVEL_ORDER).fillna(0).astype(int)
+
+    df["course_attendance_summary"] = parsed.apply(
+        lambda lst: ", ".join(f"{c['course']}: {c['absent_pct']}%" for c in lst)
+        if lst else pd.NA
+    )
+    return df
+
+
+def risk_distribution(df_subset: pd.DataFrame) -> pd.Series:
+    """Counts of risk categories within the given subset (Safe -> High order)."""
+    if df_subset.empty or "risk_category" not in df_subset.columns:
+        return pd.Series(dtype=int)
+    counts = df_subset["risk_category"].value_counts()
+    order = ["High Risk", "At Risk", "Low Risk", "Safe Zone", "No Data"]
+    return counts.reindex(order).dropna().astype(int)
+
+
+# ---------------------------------------------------------------------------
+# Bucket logic
+# ---------------------------------------------------------------------------
+
+def _assign_bucket(row) -> str:
+    status = row.get("followup_status")
+    refer = row.get("refer_to")
+
+    s = str(status).strip().lower() if pd.notna(status) else ""
+    r = str(refer).strip() if pd.notna(refer) else ""
+
+    # rule 7 — neither contacted nor referred -> Pending Contact (queued for first call)
+    if s == "" and r == "":
+        return "Pending Contact"
+
+    # rule 1 / 2
+    if s == "closed":
+        return "Closed"
+    if s == "freeze":
+        return "SFC"
+
+    # rule 3 / 4 — Not Responding
+    if s == "not responding":
+        if r in ("", "CCD"):
+            return "Not Responding"
+        return _norm_dept_bucket(r)
+
+    # rule 5 / 6 — bucket by Refer To
+    if r in ("", "CCD"):
+        return "CCD-Joined"
+    return _norm_dept_bucket(r)
+
+
+def _norm_dept_bucket(refer_value: str) -> str:
+    """Map Refer To values onto canonical bucket names (with simple aliases)."""
+    r = refer_value.strip().upper()
+    aliases = {
+        "CSM": "CSM",
+        "TREASURER": "Treasurer",
+        "TREASURE": "Treasurer",
+        "SFC": "SFC",
+        "SDC": "SDC",
+        "CCD": "CCD-Joined",
+    }
+    return aliases.get(r, refer_value.strip())
+
+
+# ---------------------------------------------------------------------------
+# Aggregations
+# ---------------------------------------------------------------------------
+
+def bucket_counts(df_week: pd.DataFrame) -> dict[str, int]:
+    counts = df_week["bucket"].value_counts(dropna=True).to_dict()
+    return {b: int(counts.get(b, 0)) for b in BUCKET_ORDER}
+
+
+def not_responding_split(df_week: pd.DataFrame) -> dict[str, int]:
+    nr = df_week[df_week["bucket"] == "Not Responding"]
+    return {
+        "First Miss": int((nr["no_of_follow_up"] <= 1).sum()),
+        "Red Zone":   int((nr["no_of_follow_up"] >  1).sum()),
+    }
+
+
+def forwarded_count(df_week: pd.DataFrame) -> int:
+    return int(df_week["bucket"].isin(FORWARDED_BUCKETS).sum())
+
+
+def status_distribution_in_dept(df_week: pd.DataFrame, dept_bucket: str) -> pd.Series:
+    """For Tab 2 drill: for students in a department, show their followup_status counts."""
+    sub = df_week[df_week["bucket"] == dept_bucket]
+    return sub["followup_status"].fillna("(no status)").value_counts()
+
+
+def students_in_bucket(df_week: pd.DataFrame, bucket: str) -> pd.DataFrame:
+    return df_week[df_week["bucket"] == bucket].copy()
+
+
+def students_in_dept_with_status(df_week: pd.DataFrame, dept_bucket: str, status: str) -> pd.DataFrame:
+    sub = df_week[df_week["bucket"] == dept_bucket]
+    if status == "(no status)":
+        return sub[sub["followup_status"].isna()].copy()
+    return sub[sub["followup_status"] == status].copy()
+
+
+# ---------------------------------------------------------------------------
+# Journey helpers (Tab 2 — full semester timeline)
+# ---------------------------------------------------------------------------
+
+def ever_forwarded_ids(df_all: pd.DataFrame) -> set[str]:
+    """Student IDs that were ever forwarded to a non-CCD department in any week."""
+    mask = df_all["bucket"].isin(FORWARDED_BUCKETS)
+    return set(df_all.loc[mask, "student_id"].dropna().unique())
+
+
+def latest_row_per_student(df_all: pd.DataFrame) -> pd.DataFrame:
+    """For every student, return the row from the latest week they appear in."""
+    idx = df_all.groupby("student_id")["week"].idxmax()
+    return df_all.loc[idx].reset_index(drop=True)
+
+
+def first_forward_row_per_student(df_all: pd.DataFrame) -> pd.DataFrame:
+    """For every ever-forwarded student, return the row from the FIRST week they
+    appeared in a forwarded bucket. Useful for 'forwarded by which dept first'."""
+    fwd = df_all[df_all["bucket"].isin(FORWARDED_BUCKETS)]
+    idx = fwd.groupby("student_id")["week"].idxmin()
+    return fwd.loc[idx].reset_index(drop=True)
+
+
+def student_timeline(df_all: pd.DataFrame, student_id: str) -> pd.DataFrame:
+    """All rows for one student, sorted by week (a chronological case file)."""
+    return (df_all[df_all["student_id"] == student_id]
+            .sort_values("week")
+            .reset_index(drop=True))
+
+
+def journey_pivot(df_all: pd.DataFrame, student_ids: list[str]) -> pd.DataFrame:
+    """
+    For the given students, return a wide table:
+        student_id | student_name | program | wk_1 | wk_2 | ... | wk_N | latest_refer_to
+    Each wk_X cell holds the bucket for that student in that week (empty if absent).
+    """
+    weeks = sorted(df_all["week"].dropna().unique().astype(int).tolist())
+    sub = df_all[df_all["student_id"].isin(student_ids)].copy()
+
+    pivoted = sub.pivot_table(
+        index="student_id", columns="week", values="bucket",
+        aggfunc="first").reindex(columns=weeks)
+    pivoted.columns = [f"wk_{int(w)}" for w in pivoted.columns]
+
+    latest = latest_row_per_student(sub).set_index("student_id")
+    pivoted["latest_refer_to"] = latest["refer_to"]
+    pivoted["latest_status"] = latest["followup_status"]
+    pivoted["latest_followups"] = latest["no_of_follow_up"]
+
+    # attach static identity columns
+    ident = (sub.sort_values("week")
+                .drop_duplicates("student_id", keep="last")
+                .set_index("student_id")[["student_name", "program", "phone"]])
+    pivoted = ident.join(pivoted, how="right")
+    return pivoted.reset_index()
+
+
+def department_journey_summary(df_all: pd.DataFrame, dept: str) -> dict:
+    """
+    Aggregate stats for one forwarded department across the whole semester:
+      - total ever forwarded
+      - currently with this dept (latest week the student appears in == this bucket)
+      - resolved (latest bucket == CCD-Joined or Closed)
+      - returned to CCD (latest followup_status == 'Return to CCD')
+      - still not responding
+    """
+    fwd = df_all[df_all["bucket"] == dept]
+    ids = set(fwd["student_id"].dropna().unique())
+    if not ids:
+        return {"ever": 0, "currently": 0, "resolved": 0,
+                "returned": 0, "still_open": 0, "ids": []}
+
+    latest = latest_row_per_student(df_all[df_all["student_id"].isin(ids)])
+    currently = int((latest["bucket"] == dept).sum())
+    resolved  = int(latest["bucket"].isin(["CCD-Joined", "Closed"]).sum())
+    returned  = int(latest["followup_status"].fillna("").str.lower()
+                          .eq("return to ccd").sum())
+    not_resp  = int((latest["bucket"] == "Not Responding").sum())
+
+    return {
+        "ever":       len(ids),
+        "currently":  currently,
+        "resolved":   resolved,
+        "returned":   returned,
+        "still_open": not_resp,
+        "ids":        sorted(ids),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cross-week comparison (kept for ad-hoc use; Tab 2 no longer uses it)
+# ---------------------------------------------------------------------------
+
+def compare_two_weeks(df_initial: pd.DataFrame, df_followup: pd.DataFrame) -> pd.DataFrame:
+    """
+    Inner join on student_id; columns suffixed _initial and _followup so we can
+    show 'Status in Week X -> Status in Week Y' side by side.
+    """
+    keep = ["student_id", "student_name", "program", "phone",
+            "refer_to", "last_followup", "followup_status",
+            "no_of_follow_up", "reason", "remarks", "bucket"]
+    a = df_initial[[c for c in keep if c in df_initial.columns]].copy()
+    b = df_followup[[c for c in keep if c in df_followup.columns]].copy()
+    merged = a.merge(b, on="student_id", how="left",
+                     suffixes=("_initial", "_followup"))
+    return merged
+
+
+def students_in_dept_with_status_compared(merged: pd.DataFrame,
+                                          dept_bucket: str,
+                                          status: str) -> pd.DataFrame:
+    sub = merged[merged["bucket_initial"] == dept_bucket]
+    if status == "(no status)":
+        return sub[sub["followup_status_followup"].isna()].copy()
+    return sub[sub["followup_status_followup"] == status].copy()
