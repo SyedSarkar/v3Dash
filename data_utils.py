@@ -109,9 +109,99 @@ def _post_load(df: pd.DataFrame) -> pd.DataFrame:
         (df["bucket"] == "Not Responding") & (df["no_of_follow_up"] > 1)
     )
 
+    # Visit engagement enrichment (visit tracking metrics)
+    df = _enrich_with_visit_engagement(df)
+
     # Course-wise risk (parsed from attendance_current — already normalized in ingest).
     df = _enrich_with_course_risk(df)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Visit engagement enrichment
+# ---------------------------------------------------------------------------
+
+def _enrich_with_visit_engagement(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add engagement signals for Not Responding students.
+
+    Metrics:
+    - days_since_visit: Days elapsed since last_visit_date (null if never visited)
+    - visit_status: Categorical (Never Visited, Stale >30d, Recent, Active)
+    - engagement_score: Combined risk indicator (0=healthy → 100=critical)
+    """
+    if "last_visit_date" not in df.columns:
+        df["days_since_visit"] = pd.NA
+        df["visit_status"] = "Unknown"
+        df["engagement_score"] = pd.NA
+        return df
+
+    # Probe the first non-null value to infer a consistent format so pandas
+    # doesn't fall back to dateutil element-by-element (which triggers a UserWarning).
+    _sample = df["last_visit_date"].dropna().astype(str)
+    _fmt = None
+    for _s in _sample:
+        for _candidate in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y",
+                           "%d-%b-%Y", "%d-%b-%y", "%Y/%m/%d"):
+            try:
+                pd.to_datetime(_s, format=_candidate)
+                _fmt = _candidate
+                break
+            except ValueError:
+                continue
+        if _fmt:
+            break
+    df["last_visit_dt"] = pd.to_datetime(
+        df["last_visit_date"], format=_fmt, errors="coerce"
+    )
+    today = pd.Timestamp.now().normalize()
+    df["days_since_visit"] = (today - df["last_visit_dt"]).dt.days
+
+    df["visit_status"] = df.apply(lambda row: _categorize_visit_status(
+        row.get("days_since_visit"),
+        row.get("no_of_visit_in_semester")
+    ), axis=1)
+
+    df["engagement_score"] = df.apply(lambda row: _calculate_engagement_score(
+        days_since=row.get("days_since_visit"),
+        visit_count=row.get("no_of_visit_in_semester"),
+        follow_ups=row.get("no_of_follow_up")
+    ), axis=1)
+
+    return df
+
+
+def _categorize_visit_status(days_since_visit: float, visit_count: float) -> str:
+    """Returns: 'Never Visited', 'Stale (>30d)', 'Recent (7-30d)', 'Active (<7d)', 'Unknown'"""
+    if pd.isna(visit_count) or visit_count == 0:
+        return "Never Visited"
+    if pd.isna(days_since_visit):
+        return "Unknown"
+    if days_since_visit > 30:
+        return "Stale (>30d)"
+    if days_since_visit > 7:
+        return "Recent (7-30d)"
+    return "Active (<7d)"
+
+
+def _calculate_engagement_score(days_since: float, visit_count: float,
+                                follow_ups: float) -> int:
+    """
+    Engagement score (0-100, higher = riskier).
+
+    Weights:
+    - 50%: Time since last visit (freshness)
+    - 30%: Visit count in semester (consistency)
+    - 20%: Follow-ups attempted (resistance to contact)
+    """
+    if pd.isna(visit_count) or visit_count == 0:
+        return 100
+
+    days_score = min(100, (days_since or 0) * (100 / 60)) if pd.notna(days_since) else 50
+    visit_score = max(0, 100 - (visit_count * 20))
+    followup_score = min(100, (follow_ups or 0) * 30)
+
+    return int(0.5 * days_score + 0.3 * visit_score + 0.2 * followup_score)
 
 
 # ---------------------------------------------------------------------------
@@ -263,6 +353,248 @@ def not_responding_split(df_week: pd.DataFrame) -> dict[str, int]:
         "First Miss": int((nr["no_of_follow_up"] <= 1).sum()),
         "Red Zone":   int((nr["no_of_follow_up"] >  1).sum()),
     }
+
+
+def not_responding_by_visit_status(df_week: pd.DataFrame) -> dict[str, int]:
+    """Split Not Responding into engagement tiers based on visit patterns."""
+    nr = df_week[df_week["bucket"] == "Not Responding"]
+    return {
+        "Never Visited": int((nr["visit_status"] == "Never Visited").sum()),
+        "Stale (>30d)": int((nr["visit_status"] == "Stale (>30d)").sum()),
+        "Recent (7-30d)": int((nr["visit_status"] == "Recent (7-30d)").sum()),
+        "Active (<7d)": int((nr["visit_status"] == "Active (<7d)").sum()),
+    }
+
+
+def engagement_distribution(df_subset: pd.DataFrame) -> dict:
+    """Return engagement score distribution breakdown (critical/high/medium/low)."""
+    if "engagement_score" not in df_subset.columns:
+        return {"critical": 0, "high": 0, "medium": 0, "low": 0, "mean": 0.0}
+    scores = df_subset["engagement_score"].dropna()
+    if scores.empty:
+        return {"critical": 0, "high": 0, "medium": 0, "low": 0, "mean": 0.0}
+    return {
+        "critical": int((scores >= 70).sum()),
+        "high": int(((scores >= 50) & (scores < 70)).sum()),
+        "medium": int(((scores >= 30) & (scores < 50)).sum()),
+        "low": int((scores < 30).sum()),
+        "mean": float(scores.mean()),
+    }
+
+
+
+# ---------------------------------------------------------------------------
+# Triage segmentation (gate-entry × absence × follow-up layering)
+# ---------------------------------------------------------------------------
+
+def _assign_triage_segment(row) -> str:
+    """
+    Three-tier triage based on:
+      - visit_status  (gate / campus engagement proxy)
+      - current_accumulative_absent_pct
+      - bucket / followup status
+
+    Tier 1 CRITICAL  — on campus but skipping + not reachable  → SDC
+    Tier 2 HIGH RISK — in process or stale, high absences      → escalate
+    Tier 3 MONITOR   — everything else that is Not Responding
+    """
+    bucket = str(row.get("bucket", "")).strip()
+    visit  = str(row.get("visit_status", "")).strip()
+    absent = row.get("current_accumulative_absent_pct")
+    fu     = int(row.get("no_of_follow_up", 0) or 0)
+
+    if bucket != "Not Responding":
+        return "other"
+
+    high_absence = pd.notna(absent) and float(absent) >= 51
+
+    # CRITICAL: came to campus (Active or Recent) + high absence + not answering
+    if visit in ("Active (<7d)", "Recent (7-30d)") and high_absence:
+        return "critical"
+
+    # HIGH RISK: stale engagement + high absence, OR multiple failed follow-ups
+    if (visit == "Stale (>30d)" and high_absence) or (fu >= 2 and high_absence):
+        return "high_risk"
+
+    # WELFARE: never visited at all — different problem, different referral
+    if visit == "Never Visited":
+        return "welfare"
+
+    # DEFAULT MONITOR
+    return "monitor"
+
+
+TRIAGE_LABELS = {
+    "critical":  "Critical — On Campus, Skipping Classes",
+    "high_risk": "High Risk — Stale Engagement, High Absences",
+    "welfare":   "Welfare / Family — Never Visited Campus",
+    "monitor":   "Monitor — Lower Severity",
+}
+
+TRIAGE_COLORS = {
+    "critical":  "#dc2626",   # red
+    "high_risk": "#f97316",   # orange
+    "welfare":   "#a855f7",   # purple
+    "monitor":   "#eab308",   # yellow
+    "other":     "#475569",   # gray
+}
+
+TRIAGE_REFERRAL = {
+    "critical":  "→ Refer to SDC (Student Discipline Center)",
+    "high_risk": "→ Escalate via CCD; consider SDC if unresolved",
+    "welfare":   "→ Welfare/home visit; refer to CSM or SFC",
+    "monitor":   "→ Standard follow-up; continue CCD contact",
+}
+
+
+def enrich_with_triage(df_week: pd.DataFrame) -> pd.DataFrame:
+    """Add triage_segment column and days_since_followup to a week's dataframe."""
+    df = df_week.copy()
+    df["triage_segment"] = df.apply(_assign_triage_segment, axis=1)
+
+    # days since last follow-up attempt
+    if "followup_date" in df.columns:
+        df["followup_dt"] = pd.to_datetime(df["followup_date"], errors="coerce")
+        today = pd.Timestamp.now().normalize()
+        df["days_since_followup"] = (today - df["followup_dt"]).dt.days
+    else:
+        df["days_since_followup"] = pd.NA
+
+    return df
+
+
+def triage_counts(df_week: pd.DataFrame) -> dict[str, int]:
+    """Count of Not Responding students per triage tier."""
+    nr = df_week[df_week["bucket"] == "Not Responding"].copy()
+    if "triage_segment" not in nr.columns:
+        nr = enrich_with_triage(nr)
+    counts = nr["triage_segment"].value_counts().to_dict()
+    return {k: int(counts.get(k, 0)) for k in ["critical", "high_risk", "welfare", "monitor"]}
+
+
+def morning_briefing_df(df_week: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return the priority hotlist for Not Responding students with all columns
+    needed for the morning briefing table, sorted by triage_segment severity.
+    """
+    nr = df_week[df_week["bucket"] == "Not Responding"].copy()
+    if "triage_segment" not in nr.columns:
+        nr = enrich_with_triage(nr)
+
+    sort_order = {"critical": 0, "high_risk": 1, "welfare": 2, "monitor": 3, "other": 4}
+    nr["_sort"] = nr["triage_segment"].map(sort_order).fillna(4)
+
+    display_cols = [
+        "student_id", "student_name", "program",
+        "visit_status", "current_accumulative_absent_pct",
+        "no_of_follow_up", "days_since_followup",
+        "followup_status", "triage_segment",
+        "phone", "reason", "remarks",
+    ]
+    available = [c for c in display_cols if c in nr.columns]
+    return (nr.sort_values(["_sort", "no_of_follow_up"], ascending=[True, False])
+              .reset_index(drop=True)[available])
+
+
+# ---------------------------------------------------------------------------
+# Department bucket detail helpers (CCD-Joined, CSM, Treasurer, SFC, SDC)
+# ---------------------------------------------------------------------------
+
+# Canonical outcome groups — shared across all departments now that CSM/SFC/etc.
+# also record Potential Joined / Potential Inprocess / Not Responding.
+OUTCOME_GROUPS = {
+    "Joined / Resolved": ["Potential Joined", "CCD-Joined", "Joined"],
+    "In Process":        ["Potential Inprocess", "Inprocess", "In Process"],
+    "Not Responding":    ["Not Responding"],
+    "Returned to CCD":   ["Return to CCD", "Return CCD"],
+    "Closed / Freeze":   ["Closed", "Freeze"],
+    "Other":             [],          # catch-all
+}
+
+OUTCOME_COLORS = {
+    "Joined / Resolved": "#16a34a",
+    "In Process":        "#0ea5e9",
+    "Not Responding":    "#dc2626",
+    "Returned to CCD":   "#f59e0b",
+    "Closed / Freeze":   "#64748b",
+    "Other":             "#475569",
+}
+
+
+def _outcome_group(status: str) -> str:
+    """Map a raw followup_status string to a canonical outcome group label."""
+    if pd.isna(status) or str(status).strip() == "":
+        return "Other"
+    s = str(status).strip()
+    for group, members in OUTCOME_GROUPS.items():
+        if group == "Other":
+            continue
+        if any(s.lower() == m.lower() for m in members):
+            return group
+    # partial match fallback
+    sl = s.lower()
+    if "joined" in sl:
+        return "Joined / Resolved"
+    if "inprocess" in sl or "in process" in sl:
+        return "In Process"
+    if "not responding" in sl:
+        return "Not Responding"
+    if "return" in sl:
+        return "Returned to CCD"
+    if "closed" in sl or "freeze" in sl:
+        return "Closed / Freeze"
+    return "Other"
+
+
+def dept_outcome_summary(df_week: pd.DataFrame, bucket: str) -> dict:
+    """
+    For one bucket (e.g. 'CSM'), return outcome group counts and totals.
+    Returns dict with keys: total, by_outcome (dict group->count), by_status (Series).
+    """
+    sub = df_week[df_week["bucket"] == bucket].copy()
+    if sub.empty:
+        return {"total": 0, "by_outcome": {}, "by_status": pd.Series(dtype=int)}
+
+    sub["outcome_group"] = sub["followup_status"].apply(_outcome_group)
+    by_outcome = sub["outcome_group"].value_counts().to_dict()
+    by_status  = sub["followup_status"].fillna("(no status)").value_counts()
+
+    return {
+        "total":      len(sub),
+        "by_outcome": {g: int(by_outcome.get(g, 0)) for g in OUTCOME_GROUPS},
+        "by_status":  by_status,
+        "df":         sub,
+    }
+
+
+def dept_program_breakdown(df_dept: pd.DataFrame) -> pd.DataFrame:
+    """Top programs represented in a department bucket, with outcome split."""
+    if df_dept.empty or "program" not in df_dept.columns:
+        return pd.DataFrame()
+    df = df_dept.copy()
+    if "outcome_group" not in df.columns:
+        df["outcome_group"] = df["followup_status"].apply(_outcome_group)
+    return (
+        df.groupby(["program", "outcome_group"])
+          .size()
+          .reset_index(name="count")
+          .sort_values("count", ascending=False)
+    )
+
+
+def students_never_visited(df_week: pd.DataFrame) -> pd.DataFrame:
+    """Flag students with zero campus engagement despite multiple follow-ups."""
+    nr = df_week[df_week["bucket"] == "Not Responding"]
+    return nr[(nr["visit_status"] == "Never Visited") & (nr["no_of_follow_up"] >= 2)].copy()
+
+
+def students_stale_visit(df_week: pd.DataFrame, days_threshold: int = 30) -> pd.DataFrame:
+    """Students not visited in N+ days but previously engaged."""
+    nr = df_week[df_week["bucket"] == "Not Responding"]
+    return nr[
+        (nr["no_of_visit_in_semester"] > 0) &
+        (nr["days_since_visit"] >= days_threshold)
+    ].copy()
 
 
 def forwarded_count(df_week: pd.DataFrame) -> int:

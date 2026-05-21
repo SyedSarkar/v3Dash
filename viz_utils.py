@@ -19,16 +19,27 @@ from data_utils import (
     BUCKET_ORDER,
     DEPARTMENT_BUCKETS,
     FORWARDED_BUCKETS,
+    OUTCOME_COLORS,
+    OUTCOME_GROUPS,
     RISK_COLORS,
     RISK_LEVEL_ORDER,
     STATUS_COLORS,
+    TRIAGE_COLORS,
+    TRIAGE_LABELS,
+    TRIAGE_REFERRAL,
     bucket_counts,
     department_journey_summary,
+    dept_outcome_summary,
+    dept_program_breakdown,
+    engagement_distribution,
+    enrich_with_triage,
     ever_forwarded_ids,
     first_forward_row_per_student,
     forwarded_count,
     journey_pivot,
     latest_row_per_student,
+    morning_briefing_df,
+    not_responding_by_visit_status,
     not_responding_split,
     risk_distribution,
     status_distribution_in_dept,
@@ -36,11 +47,16 @@ from data_utils import (
     students_in_bucket,
     students_in_dept_with_status,
     students_in_dept_with_status_compared,
+    students_never_visited,
+    students_stale_visit,
+    triage_counts,
 )
 
 
 DETAIL_COLUMNS = [
     "student_id", "student_name", "program", "phone",
+    "last_visit_date", "days_since_visit", "visit_status",
+    "no_of_visit_in_semester", "engagement_score",
     "refer_to", "last_followup", "followup_status",
     "no_of_follow_up", "reason", "remarks",
     "followup_date", "next_followup_date",
@@ -293,11 +309,43 @@ def _reasons_chart(
 
     st.plotly_chart(fig, use_container_width=True)
     
+
+
+def _render_risk_distribution(df_week: pd.DataFrame):
+    """Bar chart showing distribution of students across risk categories based on course attendance."""
+    if "risk_category" not in df_week.columns:
+        st.info("No risk category data available.")
+        return
+    
+    risk_counts = df_week["risk_category"].value_counts()
+    order = ["High Risk", "At Risk", "Low Risk", "Safe Zone", "No Data"]
+    risk_counts = risk_counts.reindex(order).fillna(0).astype(int)
+    
+    fig = px.bar(
+        x=risk_counts.index,
+        y=risk_counts.values,
+        title="Academic Risk Distribution (Based on Course Attendance)",
+        labels={"x": "Risk Category", "y": "Number of Students"},
+        color=risk_counts.index,
+        color_discrete_map={
+            "High Risk": "#dc2626",
+            "At Risk": "#f97316",
+            "Low Risk": "#eab308",
+            "Safe Zone": "#16a34a",
+            "No Data": "#475569"
+        }
+    )
+    fig.update_layout(showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def render_three_day_report(df: pd.DataFrame, week: int):
     df_week = df[df["week"] == week].copy()
 
     counts = bucket_counts(df_week)
     nr_split = not_responding_split(df_week)
+    nr_visit_split = not_responding_by_visit_status(df_week)
+    eng_dist = engagement_distribution(df_week[df_week["bucket"] == "Not Responding"])
     total_flagged = len(df_week)
     fwd = forwarded_count(df_week)
     contacted = total_flagged - counts.get("Pending Contact", 0)
@@ -356,15 +404,523 @@ def render_three_day_report(df: pd.DataFrame, week: int):
         
         if open_b == "Not Responding":
             sub = students_in_bucket(df_week, open_b)
-            tab_first, tab_red = st.tabs(
-                [f"First Miss ({nr_split['First Miss']})",
-                 f"Red Zone ({nr_split['Red Zone']})"])
-            with tab_first:
-                _detail_table(sub[sub["no_of_follow_up"] <= 1], filter_key="first_miss")
-            with tab_red:
-                _detail_table(sub[sub["no_of_follow_up"] > 1], filter_key="red_zone")
+            sub = enrich_with_triage(sub)
+            t_counts = triage_counts(df_week)
+            total_nr = len(sub)
+
+            # ----------------------------------------------------------------
+            # Section 1: Triage Pyramid — layered by gate × absence × status
+            # ----------------------------------------------------------------
+            st.markdown("### Triage Pyramid")
+            st.caption(
+                "Students are split by **campus presence × absence rate × follow-up response**. "
+                "Gate entry data distinguishes a *discipline* issue (on campus, skipping) "
+                "from a *welfare* issue (never came). Different tiers → different referral paths."
+            )
+
+            def _pct(n):
+                return f"{n / total_nr * 100:.0f}%" if total_nr else "—"
+
+            tier_col1, tier_col2, tier_col3, tier_col4 = st.columns(4)
+
+            with tier_col1:
+                n = t_counts["critical"]
+                st.markdown(
+                    f"""
+                    <div style="background:#dc2626;border-radius:10px;padding:14px 16px;min-height:130px;">
+                      <div style="color:#fca5a5;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
+                                  text-transform:uppercase;">🚨 Critical</div>
+                      <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
+                                  margin-top:4px;">{n}</div>
+                      <div style="color:#fca5a5;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
+                      <div style="color:#fee2e2;font-size:0.78rem;margin-top:8px;line-height:1.4;">
+                        On campus, skipping classes<br>+51% absent + no response
+                      </div>
+                      <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
+                        → Refer to SDC
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with tier_col2:
+                n = t_counts["high_risk"]
+                st.markdown(
+                    f"""
+                    <div style="background:#ea580c;border-radius:10px;padding:14px 16px;min-height:130px;">
+                      <div style="color:#fed7aa;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
+                                  text-transform:uppercase;">⚠️ High Risk</div>
+                      <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
+                                  margin-top:4px;">{n}</div>
+                      <div style="color:#fed7aa;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
+                      <div style="color:#ffedd5;font-size:0.78rem;margin-top:8px;line-height:1.4;">
+                        Stale campus presence<br>+51% absent, multiple failed follow-ups
+                      </div>
+                      <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
+                        → Escalate; consider SDC
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with tier_col3:
+                n = t_counts["welfare"]
+                st.markdown(
+                    f"""
+                    <div style="background:#7c3aed;border-radius:10px;padding:14px 16px;min-height:130px;">
+                      <div style="color:#ddd6fe;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
+                                  text-transform:uppercase;">🏠 Welfare</div>
+                      <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
+                                  margin-top:4px;">{n}</div>
+                      <div style="color:#ddd6fe;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
+                      <div style="color:#ede9fe;font-size:0.78rem;margin-top:8px;line-height:1.4;">
+                        Never visited campus at all<br>Family/financial/health barrier
+                      </div>
+                      <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
+                        → Home visit or CSM/SFC
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with tier_col4:
+                n = t_counts["monitor"]
+                st.markdown(
+                    f"""
+                    <div style="background:#b45309;border-radius:10px;padding:14px 16px;min-height:130px;">
+                      <div style="color:#fde68a;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
+                                  text-transform:uppercase;">📋 Monitor</div>
+                      <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
+                                  margin-top:4px;">{n}</div>
+                      <div style="color:#fde68a;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
+                      <div style="color:#fef3c7;font-size:0.78rem;margin-top:8px;line-height:1.4;">
+                        Lower severity, first miss<br>or lower absence rate
+                      </div>
+                      <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
+                        → Standard CCD follow-up
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            st.markdown("")  # breathing room after cards
+
+            # ----------------------------------------------------------------
+            # Section 2: Morning Briefing Hotlist
+            # ----------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("### 📋 Morning Briefing — Priority Hotlist")
+            st.caption(
+                "Sorted by severity. Use the filters below to narrow to your action list for today."
+            )
+
+            briefing_df = morning_briefing_df(df_week)
+
+            # --- filter row -------------------------------------------------
+            f1, f2, f3, f4 = st.columns([2, 2, 2, 2])
+            with f1:
+                tier_opts = ["All"] + [
+                    TRIAGE_LABELS.get(k, k)
+                    for k in ["critical", "high_risk", "welfare", "monitor"]
+                ]
+                tier_inv = {v: k for k, v in TRIAGE_LABELS.items()}
+                tier_sel = st.selectbox(
+                    "Priority tier", tier_opts, key="nr_tier_filter"
+                )
+            with f2:
+                gate_opts = ["All", "On Campus (Active/Recent)", "Stale / Never Visited"]
+                gate_sel = st.selectbox("Campus presence", gate_opts, key="nr_gate_filter")
+            with f3:
+                abs_opts = ["All", ">50% absent", ">75% absent"]
+                abs_sel = st.selectbox("Absence threshold", abs_opts, key="nr_abs_filter")
+            with f4:
+                contact_opts = ["All", ">7 days no contact", ">14 days no contact"]
+                contact_sel = st.selectbox("Days since contact", contact_opts, key="nr_contact_filter")
+
+            filtered = briefing_df.copy()
+
+            # apply tier filter
+            if tier_sel != "All" and "triage_segment" in filtered.columns:
+                seg_key = tier_inv.get(tier_sel, tier_sel)
+                filtered = filtered[filtered["triage_segment"] == seg_key]
+
+            # apply gate / visit filter
+            if gate_sel == "On Campus (Active/Recent)" and "visit_status" in filtered.columns:
+                filtered = filtered[
+                    filtered["visit_status"].isin(["Active (<7d)", "Recent (7-30d)"])
+                ]
+            elif gate_sel == "Stale / Never Visited" and "visit_status" in filtered.columns:
+                filtered = filtered[
+                    filtered["visit_status"].isin(["Stale (>30d)", "Never Visited"])
+                ]
+
+            # apply absence filter
+            if abs_sel == ">50% absent" and "current_accumulative_absent_pct" in filtered.columns:
+                filtered = filtered[
+                    filtered["current_accumulative_absent_pct"].fillna(0) > 50
+                ]
+            elif abs_sel == ">75% absent" and "current_accumulative_absent_pct" in filtered.columns:
+                filtered = filtered[
+                    filtered["current_accumulative_absent_pct"].fillna(0) > 75
+                ]
+
+            # apply days since contact filter
+            if contact_sel == ">7 days no contact" and "days_since_followup" in filtered.columns:
+                filtered = filtered[filtered["days_since_followup"].fillna(999) > 7]
+            elif contact_sel == ">14 days no contact" and "days_since_followup" in filtered.columns:
+                filtered = filtered[filtered["days_since_followup"].fillna(999) > 14]
+
+            st.caption(f"Showing **{len(filtered)}** students (of {total_nr} total Not Responding)")
+
+            # --- render styled table ----------------------------------------
+            def _row_style(row):
+                seg = row.get("triage_segment", "monitor")
+                bg = {
+                    "critical":  "#fef2f2",
+                    "high_risk": "#fff7ed",
+                    "welfare":   "#faf5ff",
+                    "monitor":   "#fefce8",
+                }.get(seg, "")
+                return [f"background-color: {bg}" for _ in row]
+
+            def _seg_cell(val):
+                color = TRIAGE_COLORS.get(val, "#475569")
+                label = {
+                    "critical":  "🚨 Critical",
+                    "high_risk": "⚠️ High Risk",
+                    "welfare":   "🏠 Welfare",
+                    "monitor":   "📋 Monitor",
+                }.get(val, val)
+                return (
+                    f"background-color:{color}; color:white; "
+                    f"font-weight:600; border-radius:4px; padding:2px 6px;"
+                )
+
+            def _absence_cell(val):
+                if pd.isna(val):
+                    return ""
+                v = float(val)
+                if v >= 75:
+                    return "background-color:#fef2f2; color:#dc2626; font-weight:600;"
+                if v >= 51:
+                    return "background-color:#fff7ed; color:#ea580c; font-weight:600;"
+                return ""
+
+            rename_map = {
+                "student_id":                    "ID",
+                "student_name":                  "Name",
+                "program":                       "Program",
+                "visit_status":                  "Campus Presence",
+                "current_accumulative_absent_pct": "Absence %",
+                "no_of_follow_up":               "Follow-ups Made",
+                "days_since_followup":           "Days Since Contact",
+                "followup_status":               "Follow-up Status",
+                "triage_segment":                "Priority Tier",
+                "phone":                         "Phone",
+                "reason":                        "Reason",
+                "remarks":                       "Remarks",
+            }
+            show = filtered.rename(columns=rename_map)
+            # round float columns that reach the screen
+            for col in ("Absence %", "Days Since Contact", "Follow-ups Made"):
+                if col in show.columns:
+                    show[col] = pd.to_numeric(show[col], errors="coerce").round(1)
+
+            styler = show.style.apply(_row_style, axis=1)
+            if "Priority Tier" in show.columns:
+                styler = styler.map(_seg_cell, subset=["Priority Tier"])
+            if "Absence %" in show.columns:
+                styler = styler.map(_absence_cell, subset=["Absence %"])
+
+            st.dataframe(styler, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "⬇ Download morning briefing CSV",
+                filtered.to_csv(index=False).encode("utf-8"),
+                file_name=f"morning_briefing_week{week}.csv",
+                mime="text/csv",
+                key=_ss_key("dl_briefing", week),
+            )
+
+            # ----------------------------------------------------------------
+            # Section 3: Why different referrals? (collapsible explainer)
+            # ----------------------------------------------------------------
+            with st.expander("ℹ️ How triage segmentation works", expanded=False):
+                st.markdown(
+                    """
+**The key insight:** "Not Responding" is not one problem — it's at least four.
+
+| Tier | Gate / Visit | Absence | What it means | Where to refer |
+|---|---|---|---|---|
+| 🚨 Critical | Active / Recent | ≥51% | Came to campus — chose to skip | **SDC** — Discipline |
+| ⚠️ High Risk | Stale >30d | ≥51% | Was engaged, now gone | **CCD escalate → SDC** |
+| 🏠 Welfare | Never visited | Any | Never came — barrier to access | **CSM / SFC / Home visit** |
+| 📋 Monitor | Any | <51% | Lower severity, first miss | **Standard CCD follow-up** |
+
+**Campus Presence** (visit data) is the critical separator. A student
+entering the gate proves they can get to campus — high absences then
+point to a *behavioural / discipline* issue, not a *logistics / welfare*
+issue. Treating them the same wastes resources and delays the right
+intervention.
+                    """
+                )
+
+            # ----------------------------------------------------------------
+            # Section 4: Legacy breakdown tabs (visit-based, kept for detail)
+            # ----------------------------------------------------------------
+            st.markdown("---")
+            st.markdown("### Engagement Detail (by Visit Pattern)")
+            never_visited_count = int((sub["visit_status"] == "Never Visited").sum())
+            stale_count = int((sub["visit_status"] == "Stale (>30d)").sum())
+            recent_count = int((sub["visit_status"].isin(["Recent (7-30d)", "Active (<7d)"])).sum())
+
+            tab_never, tab_stale, tab_responsive = st.tabs([
+                f"🚨 Never Visited ({never_visited_count})",
+                f"⚠️ Stale >30d ({stale_count})",
+                f"✓ Recent Activity ({recent_count})",
+            ])
+
+            with tab_never:
+                st.warning(
+                    "**No campus engagement despite follow-ups.** "
+                    "Likely a systemic barrier — financial, family, or health. "
+                    "Consider home visit or CSM referral."
+                )
+                _detail_table(sub[sub["visit_status"] == "Never Visited"],
+                              filter_key="never_visited")
+
+            with tab_stale:
+                st.error(
+                    "**High Risk: Disengaged for 30+ days.** "
+                    "Was active before. Needs warm re-engagement call; "
+                    "if absent >51% and multiple missed calls → SDC."
+                )
+                _detail_table(sub[sub["visit_status"] == "Stale (>30d)"],
+                              filter_key="stale_visits")
+
+            with tab_responsive:
+                st.success(
+                    "**Positive Signal: Recent campus activity detected.** "
+                    "May be a communication gap or timing issue — try a different contact window."
+                )
+                _detail_table(
+                    sub[sub["visit_status"].isin(["Recent (7-30d)", "Active (<7d)"])],
+                    filter_key="responsive",
+                )
         else:
-            _detail_table(students_in_bucket(df_week, open_b), filter_key=open_b.lower().replace("-", "_"))
+            _render_dept_detail(df_week, open_b, week)
+
+
+# ---------------------------------------------------------------------------
+# Department detail panel (CCD-Joined, CSM, Treasurer, SFC, SDC)
+# ---------------------------------------------------------------------------
+
+def _render_dept_detail(df_week: pd.DataFrame, bucket: str, week: int):
+    """
+    Rich detail view for any department bucket.
+
+    Layout:
+      1. Outcome KPI strip  — Joined / In Process / Not Responding / Returned / Closed
+      2. Outcome donut chart (Plotly)  +  reasons bar chart side by side
+      3. Status filter chips  →  filtered student table
+      4. Program breakdown (horizontal stacked bar)
+    """
+    summary = dept_outcome_summary(df_week, bucket)
+    total   = summary["total"]
+
+    if total == 0:
+        st.info(f"No students currently in the {bucket} bucket.")
+        return
+
+    dept_df = summary["df"].copy()   # already has outcome_group column
+
+    # ── 1. Outcome KPI strip ────────────────────────────────────────────────
+    outcome_order = [
+        "Joined / Resolved", "In Process", "Not Responding",
+        "Returned to CCD", "Closed / Freeze", "Other",
+    ]
+    kpi_cols = st.columns(len(outcome_order))
+    for col, grp in zip(kpi_cols, outcome_order):
+        n   = summary["by_outcome"].get(grp, 0)
+        pct = f"{n / total * 100:.0f}%" if total else "—"
+        clr = OUTCOME_COLORS[grp]
+        with col:
+            st.markdown(
+                f"""
+                <div style="background:{clr};border-radius:8px;padding:10px 12px;
+                            min-height:90px;text-align:center;">
+                  <div style="color:rgba(255,255,255,.8);font-size:0.72rem;
+                              font-weight:600;letter-spacing:.04em;text-transform:uppercase;
+                              line-height:1.2;">{grp}</div>
+                  <div style="color:white;font-size:1.7rem;font-weight:700;
+                              line-height:1.1;margin-top:4px;">{n}</div>
+                  <div style="color:rgba(255,255,255,.75);font-size:0.78rem;">{pct}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    st.markdown("")
+
+    # ── 2. Donut + Reasons side by side ─────────────────────────────────────
+    ch1, ch2 = st.columns(2)
+
+    with ch1:
+        # outcome donut
+        grps   = [g for g in outcome_order if summary["by_outcome"].get(g, 0) > 0]
+        values = [summary["by_outcome"][g] for g in grps]
+        colors = [OUTCOME_COLORS[g] for g in grps]
+
+        fig_donut = go.Figure(go.Pie(
+            labels=grps, values=values,
+            marker_colors=colors,
+            hole=0.55,
+            textinfo="label+percent",
+            textfont_size=11,
+            hovertemplate="%{label}: %{value} students<extra></extra>",
+        ))
+        fig_donut.update_layout(
+            title=f"{bucket} — outcome breakdown",
+            showlegend=False,
+            margin=dict(l=10, r=10, t=40, b=10),
+            height=300,
+        )
+        st.plotly_chart(fig_donut, use_container_width=True)
+
+    with ch2:
+        # reasons bar (same as CCD block but for this dept)
+        reasons = dept_df["reason"].dropna()
+        reasons = reasons[reasons.str.strip() != ""]
+        if not reasons.empty:
+            rc = reasons.value_counts().head(8).reset_index()
+            rc.columns = ["Reason", "Count"]
+            fig_r = px.bar(
+                rc, x="Count", y="Reason", orientation="h",
+                title="Top reasons given",
+                color="Count", color_continuous_scale="Blues",
+                text="Count",
+            )
+            fig_r.update_traces(textposition="outside", textfont_size=11)
+            fig_r.update_layout(
+                height=300, yaxis=dict(autorange="reversed"),
+                showlegend=False, margin=dict(l=10, r=10, t=40, b=10),
+            )
+            st.plotly_chart(fig_r, use_container_width=True)
+        else:
+            st.info("No reason data for this bucket.")
+
+    # ── 3. Status filter → student table ────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### Filter by follow-up status")
+
+    raw_statuses = ["All"] + summary["by_status"].index.tolist()
+    status_sel = st.selectbox(
+        "Show students with status",
+        raw_statuses,
+        key=_ss_key("dept_status_filter", bucket, week),
+    )
+
+    if status_sel == "All":
+        display_df = dept_df.copy()
+    elif status_sel == "(no status)":
+        display_df = dept_df[dept_df["followup_status"].isna()].copy()
+    else:
+        display_df = dept_df[dept_df["followup_status"] == status_sel].copy()
+
+    st.caption(
+        f"Showing **{len(display_df)}** of {total} students "
+        f"{'(all)' if status_sel == 'All' else f'with status: {status_sel}'}"
+    )
+
+    # colour rows by outcome group
+    def _outcome_row_style(row):
+        grp = row.get("outcome_group", "Other")
+        bg = {
+            "Joined / Resolved": "#f0fdf4",
+            "In Process":        "#f0f9ff",
+            "Not Responding":    "#fef2f2",
+            "Returned to CCD":   "#fffbeb",
+            "Closed / Freeze":   "#f8fafc",
+        }.get(grp, "")
+        return [f"background-color:{bg}" for _ in row]
+
+    def _outcome_cell_style(val):
+        clr = OUTCOME_COLORS.get(val, "#475569")
+        return f"background-color:{clr};color:white;font-weight:600;"
+
+    show_cols = [
+        "student_id", "student_name", "program", "phone",
+        "followup_status", "outcome_group",
+        "no_of_follow_up", "reason", "remarks",
+        "accumulative_absent_pct", "current_accumulative_absent_pct",
+        "risk_category", "course_attendance_summary",
+        "last_followup", "followup_date", "next_followup_date",
+        "follow_up_by",
+    ]
+    show = display_df[[c for c in show_cols if c in display_df.columns]].copy()
+
+    # round float columns
+    for fc in ("accumulative_absent_pct", "current_accumulative_absent_pct"):
+        if fc in show.columns:
+            show[fc] = pd.to_numeric(show[fc], errors="coerce").round(1)
+
+    styler = show.style.apply(_outcome_row_style, axis=1)
+    if "outcome_group" in show.columns:
+        styler = styler.map(_outcome_cell_style, subset=["outcome_group"])
+
+    def _risk_bg(val):
+        if pd.isna(val):
+            return ""
+        return f"background-color:{RISK_COLORS.get(val, '#475569')};color:white;font-weight:600;"
+
+    if "risk_category" in show.columns:
+        styler = styler.map(_risk_bg, subset=["risk_category"])
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
+
+    st.download_button(
+        f"⬇ Download {bucket} students CSV",
+        display_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{bucket.lower().replace(' ', '_')}_week{week}.csv",
+        mime="text/csv",
+        key=_ss_key("dl_dept", bucket, week, status_sel),
+    )
+
+    # ── 4. Program breakdown stacked bar ────────────────────────────────────
+    prog_df = dept_program_breakdown(dept_df)
+    if not prog_df.empty:
+        st.markdown("---")
+        st.markdown("#### Program breakdown")
+
+        # limit to top 12 programs by total count
+        top_progs = (
+            prog_df.groupby("program")["count"].sum()
+                   .nlargest(12).index.tolist()
+        )
+        prog_df = prog_df[prog_df["program"].isin(top_progs)]
+
+        fig_prog = px.bar(
+            prog_df,
+            x="count", y="program", color="outcome_group",
+            orientation="h",
+            color_discrete_map=OUTCOME_COLORS,
+            title=f"{bucket} — students by program & outcome",
+            labels={"count": "Students", "program": "Program",
+                    "outcome_group": "Outcome"},
+            text="count",
+        )
+        fig_prog.update_traces(textposition="inside", textfont_size=10)
+        fig_prog.update_layout(
+            height=max(280, len(top_progs) * 35),
+            yaxis=dict(autorange="reversed"),
+            legend=dict(orientation="h", y=-0.15),
+            margin=dict(l=10, r=10, t=40, b=60),
+        )
+        st.plotly_chart(fig_prog, use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
