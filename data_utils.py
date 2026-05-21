@@ -416,9 +416,9 @@ def _assign_triage_segment(row) -> str:
     if (visit == "Stale (>30d)" and high_absence) or (fu >= 2 and high_absence):
         return "high_risk"
 
-    # WELFARE: never visited at all — different problem, different referral
+    # suspecious: never visited at all — different problem, different referral
     if visit == "Never Visited":
-        return "welfare"
+        return "suspecious"
 
     # DEFAULT MONITOR
     return "monitor"
@@ -427,14 +427,14 @@ def _assign_triage_segment(row) -> str:
 TRIAGE_LABELS = {
     "critical":  "Critical — On Campus, Skipping Classes",
     "high_risk": "High Risk — Stale Engagement, High Absences",
-    "welfare":   "Welfare / Family — Never Visited Campus",
+    "suspecious":   "suspecious / Family — Never Visited Campus",
     "monitor":   "Monitor — Lower Severity",
 }
 
 TRIAGE_COLORS = {
     "critical":  "#dc2626",   # red
     "high_risk": "#f97316",   # orange
-    "welfare":   "#a855f7",   # purple
+    "suspecious":   "#a855f7",   # purple
     "monitor":   "#eab308",   # yellow
     "other":     "#475569",   # gray
 }
@@ -442,7 +442,7 @@ TRIAGE_COLORS = {
 TRIAGE_REFERRAL = {
     "critical":  "→ Refer to SDC (Student Discipline Center)",
     "high_risk": "→ Escalate via CCD; consider SDC if unresolved",
-    "welfare":   "→ Welfare/home visit; refer to CSM or SFC",
+    "suspecious":   "→ suspecious/home visit; refer to CSM or SFC",
     "monitor":   "→ Standard follow-up; continue CCD contact",
 }
 
@@ -469,7 +469,7 @@ def triage_counts(df_week: pd.DataFrame) -> dict[str, int]:
     if "triage_segment" not in nr.columns:
         nr = enrich_with_triage(nr)
     counts = nr["triage_segment"].value_counts().to_dict()
-    return {k: int(counts.get(k, 0)) for k in ["critical", "high_risk", "welfare", "monitor"]}
+    return {k: int(counts.get(k, 0)) for k in ["critical", "high_risk", "suspecious", "monitor"]}
 
 
 def morning_briefing_df(df_week: pd.DataFrame) -> pd.DataFrame:
@@ -481,7 +481,7 @@ def morning_briefing_df(df_week: pd.DataFrame) -> pd.DataFrame:
     if "triage_segment" not in nr.columns:
         nr = enrich_with_triage(nr)
 
-    sort_order = {"critical": 0, "high_risk": 1, "welfare": 2, "monitor": 3, "other": 4}
+    sort_order = {"critical": 0, "high_risk": 1, "suspecious": 2, "monitor": 3, "other": 4}
     nr["_sort"] = nr["triage_segment"].map(sort_order).fillna(4)
 
     display_cols = [

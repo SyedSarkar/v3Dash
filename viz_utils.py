@@ -355,11 +355,15 @@ def render_three_day_report(df: pd.DataFrame, week: int):
     with top1:
         st.metric("Total Flagged", total_flagged)
     with top2:
-        st.metric("Contacted so far", contacted)
+        contacted_pct = f"{contacted / total_flagged * 100:.1f}%" if total_flagged else "0%"
+        st.metric("Contacted so far", contacted, contacted_pct)
     with top3:
-        st.metric("Forwarded to Other Depts.", fwd)
+        fwd_pct = f"{fwd / total_flagged * 100:.1f}%" if total_flagged else "0%"
+        st.metric("Forwarded to Other Depts.", fwd, fwd_pct)
     with top4:
-        st.metric("Red Zone (Not Resp. ≥2 follow-ups)", nr_split["Red Zone"])
+        red_zone = nr_split["Red Zone"]
+        red_zone_pct = f"{red_zone / total_flagged * 100:.1f}%" if total_flagged else "0%"
+        st.metric("Red Zone (Not Resp. ≥2 follow-ups)", red_zone, red_zone_pct)
 
     st.markdown("---")
 
@@ -383,9 +387,9 @@ def render_three_day_report(df: pd.DataFrame, week: int):
 
     for i, (label, val, color) in enumerate(tiles):
         with cols[i]:
-            sub = None
+            sub = f"{val / total_flagged * 100:.1f}% of total" if total_flagged else "0%"
             if label == "Not Responding":
-                sub = f"First Miss: {nr_split['First Miss']}  |  Red Zone: {nr_split['Red Zone']}"
+                sub = f"{val / total_flagged * 100:.1f}% of total  |  First Miss: {nr_split['First Miss']}  |  Red Zone: {nr_split['Red Zone']}"
             if _kpi_card(label, val, color, key=_ss_key("t1_btn", label), subtitle=sub):
                 st.session_state["t1_open_bucket"] = None if clicked_bucket == label else label
                 st.rerun()
@@ -415,7 +419,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
             st.caption(
                 "Students are split by **campus presence × absence rate × follow-up response**. "
                 "Gate entry data distinguishes a *discipline* issue (on campus, skipping) "
-                "from a *welfare* issue (never came). Different tiers → different referral paths."
+                "from a *Suspecious* issue (never came). Different tiers → different referral paths."
             )
 
             def _pct(n):
@@ -466,12 +470,12 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 )
 
             with tier_col3:
-                n = t_counts["welfare"]
+                n = t_counts["suspecious"]
                 st.markdown(
                     f"""
                     <div style="background:#7c3aed;border-radius:10px;padding:14px 16px;min-height:130px;">
                       <div style="color:#ddd6fe;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
-                                  text-transform:uppercase;">⌛ Welfare</div>
+                                  text-transform:uppercase;">⌛ Suspecious</div>
                       <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
                                   margin-top:4px;">{n}</div>
                       <div style="color:#ddd6fe;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
@@ -490,16 +494,16 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 n = t_counts["monitor"]
                 st.markdown(
                     f"""
-                    <div style="background:#b45309;border-radius:10px;padding:14px 16px;min-height:130px;">
-                      <div style="color:#fde68a;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
+                    <div style="background:#f9d406;border-radius:10px;padding:14px 16px;min-height:130px;">
+                      <div style="color:#012939;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
                                   text-transform:uppercase;">📋 Monitor</div>
                       <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
                                   margin-top:4px;">{n}</div>
-                      <div style="color:#fde68a;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
-                      <div style="color:#fef3c7;font-size:0.78rem;margin-top:8px;line-height:1.4;">
+                      <div style="color:#06b3f9;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
+                      <div style="color:#024864;font-size:0.78rem;margin-top:8px;line-height:1.4;">
                         Lower severity, first miss<br>or lower absence rate
                       </div>
-                      <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
+                      <div style="color:#024864;font-size:0.75rem;font-weight:600;margin-top:6px;">
                         → Standard CCD follow-up
                       </div>
                     </div>
@@ -513,7 +517,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
             # Section 2: Morning Briefing Hotlist
             # ----------------------------------------------------------------
             st.markdown("---")
-            st.markdown("### 📋 Morning Briefing — Priority Hotlist")
+            st.markdown("### 📋 Priority List")
             st.caption(
                 "Sorted by severity. Use the filters below to narrow to your action list for today."
             )
@@ -525,7 +529,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
             with f1:
                 tier_opts = ["All"] + [
                     TRIAGE_LABELS.get(k, k)
-                    for k in ["critical", "high_risk", "welfare", "monitor"]
+                    for k in ["critical", "high_risk", "suspecious", "monitor"]
                 ]
                 tier_inv = {v: k for k, v in TRIAGE_LABELS.items()}
                 tier_sel = st.selectbox(
@@ -582,7 +586,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 bg = {
                     "critical":  "#fef2f2",
                     "high_risk": "#fff7ed",
-                    "welfare":   "#faf5ff",
+                    "suspecious":   "#e1c41e",
                     "monitor":   "#fefce8",
                 }.get(seg, "")
                 return [f"background-color: {bg}" for _ in row]
@@ -592,7 +596,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 label = {
                     "critical":  "🚨 Critical",
                     "high_risk": "⚠️ High Risk",
-                    "welfare":   "🏠 Welfare",
+                    "suspecious":   "⌛ Suspecious",
                     "monitor":   "📋 Monitor",
                 }.get(val, val)
                 return (
@@ -658,12 +662,12 @@ def render_three_day_report(df: pd.DataFrame, week: int):
 |---|---|---|---|---|
 | 🚨 Critical | Active / Recent | ≥51% | Came to campus — chose to skip | **SDC** — Discipline |
 | ⚠️ High Risk | Stale >30d | ≥51% | Was engaged, now gone | **CCD escalate → SDC** |
-| 🏠 Welfare | Never visited | Any | Never came — barrier to access | **CSM / SFC / Home visit** |
+| 🏠 suspecious | Never visited | Any | Never came — barrier to access | **CSM / SFC / Home visit** |
 | 📋 Monitor | Any | <51% | Lower severity, first miss | **Standard CCD follow-up** |
 
 **Campus Presence** (visit data) is the critical separator. A student
 entering the gate proves they can get to campus — high absences then
-point to a *behavioural / discipline* issue, not a *logistics / welfare*
+point to a *behavioural / discipline* issue, not a *logistics / suspecious*
 issue. Treating them the same wastes resources and delays the right
 intervention.
                     """
