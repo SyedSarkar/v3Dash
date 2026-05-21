@@ -471,7 +471,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                     f"""
                     <div style="background:#7c3aed;border-radius:10px;padding:14px 16px;min-height:130px;">
                       <div style="color:#ddd6fe;font-size:0.8rem;font-weight:600;letter-spacing:.04em;
-                                  text-transform:uppercase;">🏠 Welfare</div>
+                                  text-transform:uppercase;">⌛ Welfare</div>
                       <div style="color:white;font-size:2rem;font-weight:700;line-height:1.1;
                                   margin-top:4px;">{n}</div>
                       <div style="color:#ddd6fe;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
@@ -479,7 +479,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                         Never visited campus at all<br>Family/financial/health barrier
                       </div>
                       <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
-                        → Home visit or CSM/SFC
+                        → CSM/SFC
                       </div>
                     </div>
                     """,
