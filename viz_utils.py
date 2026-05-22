@@ -48,7 +48,7 @@ from data_utils import (
     students_in_dept_with_status,
     students_in_dept_with_status_compared,
     students_never_visited,
-    students_stale_visit,
+    students_low_visit_visit,
     triage_counts,
 )
 
@@ -459,7 +459,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                                   margin-top:4px;">{n}</div>
                       <div style="color:#fed7aa;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
                       <div style="color:#ffedd5;font-size:0.78rem;margin-top:8px;line-height:1.4;">
-                        Stale campus presence<br>+51% absent, multiple failed follow-ups
+                        low_visit campus presence<br>+51% absent, multiple failed follow-ups
                       </div>
                       <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
                         → Escalate; consider SDC
@@ -512,6 +512,57 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 )
 
             st.markdown("")  # breathing room after cards
+            
+            with st.expander("ℹ️ How triage segmentation works", expanded=False):
+                st.markdown(
+                    """
+**The key insight:** "Not Responding" is not one problem — it's at least four.
+
+| Tier | Gate / Visit | Absence | What it means | Where to refer |
+|---|---|---|---|---|
+| 🚨 Critical | Active / Recent | ≥51% | Came to campus — chose to skip | **SDC** — Discipline |
+| ⚠️ High Risk | low_visit >30d | ≥51% | Was engaged, now gone | **CCD escalate → SDC** |
+| ⌛ suspecious | Never visited | Any | Never came — barrier to access | **CSM / SFC** |
+| 📋 Monitor | Any | <51% | Lower severity, first miss | **Standard CCD follow-up** |
+
+**Campus Presence** (visit data) is the critical separator. A student
+entering the gate proves they can get to campus — high absences then
+point to a *behavioural / discipline* issue, not a *logistics / suspecious*
+issue. Treating them the same wastes resources and delays the right
+intervention.
+                    """
+                )
+
+
+            # ----------------------------------------------------------------
+            # Section: Reasons Donut Chart for Not Responding
+            # ----------------------------------------------------------------
+            st.markdown("### Reasons for Not Responding")
+            st.caption("Breakdown of reasons provided by students who are not responding")
+
+            reasons = sub["reason"].dropna()
+            reasons = reasons[reasons.str.strip() != ""]
+
+            if not reasons.empty:
+                reason_counts = reasons.value_counts()
+                fig_donut = go.Figure(go.Pie(
+                    labels=reason_counts.index,
+                    values=reason_counts.values,
+                    marker_colors=px.colors.qualitative.Set3,
+                    hole=0.5,
+                    textinfo="label+percent",
+                    textfont_size=11,
+                    hovertemplate="%{label}: %{value} students<extra></extra>",
+                ))
+                fig_donut.update_layout(
+                    title="Reason Distribution",
+                    showlegend=True,
+                    margin=dict(l=10, r=10, t=40, b=10),
+                    height=350,
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
+            else:
+                st.info("No reason data available for Not Responding students.")
 
             # ----------------------------------------------------------------
             # Section 2: Morning Briefing Hotlist
@@ -536,7 +587,7 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                     "Priority tier", tier_opts, key="nr_tier_filter"
                 )
             with f2:
-                gate_opts = ["All", "On Campus (Active/Recent)", "Stale / Never Visited"]
+                gate_opts = ["All", "On Campus (Active/Recent)", "low_visit / Never Visited"]
                 gate_sel = st.selectbox("Campus presence", gate_opts, key="nr_gate_filter")
             with f3:
                 abs_opts = ["All", ">50% absent", ">75% absent"]
@@ -557,9 +608,9 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                 filtered = filtered[
                     filtered["visit_status"].isin(["Active (<7d)", "Recent (7-30d)"])
                 ]
-            elif gate_sel == "Stale / Never Visited" and "visit_status" in filtered.columns:
+            elif gate_sel == "low_visit / Never Visited" and "visit_status" in filtered.columns:
                 filtered = filtered[
-                    filtered["visit_status"].isin(["Stale (>30d)", "Never Visited"])
+                    filtered["visit_status"].isin(["low_visit (>30d)", "Never Visited"])
                 ]
 
             # apply absence filter
@@ -653,38 +704,19 @@ def render_three_day_report(df: pd.DataFrame, week: int):
             # ----------------------------------------------------------------
             # Section 3: Why different referrals? (collapsible explainer)
             # ----------------------------------------------------------------
-            with st.expander("ℹ️ How triage segmentation works", expanded=False):
-                st.markdown(
-                    """
-**The key insight:** "Not Responding" is not one problem — it's at least four.
-
-| Tier | Gate / Visit | Absence | What it means | Where to refer |
-|---|---|---|---|---|
-| 🚨 Critical | Active / Recent | ≥51% | Came to campus — chose to skip | **SDC** — Discipline |
-| ⚠️ High Risk | Stale >30d | ≥51% | Was engaged, now gone | **CCD escalate → SDC** |
-| 🏠 suspecious | Never visited | Any | Never came — barrier to access | **CSM / SFC / Home visit** |
-| 📋 Monitor | Any | <51% | Lower severity, first miss | **Standard CCD follow-up** |
-
-**Campus Presence** (visit data) is the critical separator. A student
-entering the gate proves they can get to campus — high absences then
-point to a *behavioural / discipline* issue, not a *logistics / suspecious*
-issue. Treating them the same wastes resources and delays the right
-intervention.
-                    """
-                )
-
+            
             # ----------------------------------------------------------------
             # Section 4: Legacy breakdown tabs (visit-based, kept for detail)
             # ----------------------------------------------------------------
             st.markdown("---")
             st.markdown("### Engagement Detail (by Visit Pattern)")
             never_visited_count = int((sub["visit_status"] == "Never Visited").sum())
-            stale_count = int((sub["visit_status"] == "Stale (>30d)").sum())
+            low_visit_count = int((sub["visit_status"] == "low_visit (>30d)").sum())
             recent_count = int((sub["visit_status"].isin(["Recent (7-30d)", "Active (<7d)"])).sum())
 
-            tab_never, tab_stale, tab_responsive = st.tabs([
+            tab_never, tab_low_visit, tab_responsive = st.tabs([
                 f"🚨 Never Visited ({never_visited_count})",
-                f"⚠️ Stale >30d ({stale_count})",
+                f"⚠️ low_visit >30d ({low_visit_count})",
                 f"✓ Recent Activity ({recent_count})",
             ])
 
@@ -697,14 +729,14 @@ intervention.
                 _detail_table(sub[sub["visit_status"] == "Never Visited"],
                               filter_key="never_visited")
 
-            with tab_stale:
+            with tab_low_visit:
                 st.error(
                     "**High Risk: Disengaged for 30+ days.** "
                     "Was active before. Needs warm re-engagement call; "
                     "if absent >51% and multiple missed calls → SDC."
                 )
-                _detail_table(sub[sub["visit_status"] == "Stale (>30d)"],
-                              filter_key="stale_visits")
+                _detail_table(sub[sub["visit_status"] == "low_visit (>30d)"],
+                              filter_key="low_visit_visits")
 
             with tab_responsive:
                 st.success(

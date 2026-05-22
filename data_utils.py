@@ -78,7 +78,7 @@ def load_long_csv(source) -> pd.DataFrame:
 
     Intentionally NOT cached: @st.cache_data only invalidates when this
     function's own source changes, not when downstream helpers like
-    _post_load / parse_course_attendance change. Stale cache silently
+    _post_load / parse_course_attendance change. low_visit cache silently
     served wrong risk numbers after parser tweaks. The data is small
     (a few hundred rows), so re-reading is cheap.
     """
@@ -127,7 +127,7 @@ def _enrich_with_visit_engagement(df: pd.DataFrame) -> pd.DataFrame:
 
     Metrics:
     - days_since_visit: Days elapsed since last_visit_date (null if never visited)
-    - visit_status: Categorical (Never Visited, Stale >30d, Recent, Active)
+    - visit_status: Categorical (Never Visited, low_visit >30d, Recent, Active)
     - engagement_score: Combined risk indicator (0=healthy → 100=critical)
     """
     if "last_visit_date" not in df.columns:
@@ -172,13 +172,13 @@ def _enrich_with_visit_engagement(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _categorize_visit_status(days_since_visit: float, visit_count: float) -> str:
-    """Returns: 'Never Visited', 'Stale (>30d)', 'Recent (7-30d)', 'Active (<7d)', 'Unknown'"""
+    """Returns: 'Never Visited', 'low_visit (>30d)', 'Recent (7-30d)', 'Active (<7d)', 'Unknown'"""
     if pd.isna(visit_count) or visit_count == 0:
         return "Never Visited"
     if pd.isna(days_since_visit):
         return "Unknown"
     if days_since_visit > 30:
-        return "Stale (>30d)"
+        return "low_visit (>30d)"
     if days_since_visit > 7:
         return "Recent (7-30d)"
     return "Active (<7d)"
@@ -360,7 +360,7 @@ def not_responding_by_visit_status(df_week: pd.DataFrame) -> dict[str, int]:
     nr = df_week[df_week["bucket"] == "Not Responding"]
     return {
         "Never Visited": int((nr["visit_status"] == "Never Visited").sum()),
-        "Stale (>30d)": int((nr["visit_status"] == "Stale (>30d)").sum()),
+        "low_visit (>30d)": int((nr["visit_status"] == "low_visit (>30d)").sum()),
         "Recent (7-30d)": int((nr["visit_status"] == "Recent (7-30d)").sum()),
         "Active (<7d)": int((nr["visit_status"] == "Active (<7d)").sum()),
     }
@@ -395,7 +395,7 @@ def _assign_triage_segment(row) -> str:
       - bucket / followup status
 
     Tier 1 CRITICAL  — on campus but skipping + not reachable  → SDC
-    Tier 2 HIGH RISK — in process or stale, high absences      → escalate
+    Tier 2 HIGH RISK — in process or low_visit, high absences      → escalate
     Tier 3 MONITOR   — everything else that is Not Responding
     """
     bucket = str(row.get("bucket", "")).strip()
@@ -412,8 +412,8 @@ def _assign_triage_segment(row) -> str:
     if visit in ("Active (<7d)", "Recent (7-30d)") and high_absence:
         return "critical"
 
-    # HIGH RISK: stale engagement + high absence, OR multiple failed follow-ups
-    if (visit == "Stale (>30d)" and high_absence) or (fu >= 2 and high_absence):
+    # HIGH RISK: low_visit engagement + high absence, OR multiple failed follow-ups
+    if (visit == "low_visit (>30d)" and high_absence) or (fu >= 2 and high_absence):
         return "high_risk"
 
     # suspecious: never visited at all — different problem, different referral
@@ -426,7 +426,7 @@ def _assign_triage_segment(row) -> str:
 
 TRIAGE_LABELS = {
     "critical":  "Critical — On Campus, Skipping Classes",
-    "high_risk": "High Risk — Stale Engagement, High Absences",
+    "high_risk": "High Risk — low_visit Engagement, High Absences",
     "suspecious":   "suspecious / Family — Never Visited Campus",
     "monitor":   "Monitor — Lower Severity",
 }
@@ -588,7 +588,7 @@ def students_never_visited(df_week: pd.DataFrame) -> pd.DataFrame:
     return nr[(nr["visit_status"] == "Never Visited") & (nr["no_of_follow_up"] >= 2)].copy()
 
 
-def students_stale_visit(df_week: pd.DataFrame, days_threshold: int = 30) -> pd.DataFrame:
+def students_low_visit_visit(df_week: pd.DataFrame, days_threshold: int = 30) -> pd.DataFrame:
     """Students not visited in N+ days but previously engaged."""
     nr = df_week[df_week["bucket"] == "Not Responding"]
     return nr[
