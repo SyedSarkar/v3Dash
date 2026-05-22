@@ -399,13 +399,6 @@ def render_three_day_report(df: pd.DataFrame, week: int):
         st.markdown("---")
         st.markdown(f"### {open_b} — Student Details")
         
-        # Show reasons chart for CCD-Joined bucket
-        if open_b == "CCD-Joined":
-            bucket_df = students_in_bucket(df_week, open_b)
-            filter_key = open_b.lower().replace("-", "_")
-            _reasons_chart(bucket_df, title="Top Reasons for CCD-Joined Students (Missing → Joined)", filter_key=filter_key)
-            st.markdown("---")
-        
         if open_b == "Not Responding":
             sub = students_in_bucket(df_week, open_b)
             sub = enrich_with_triage(sub)
