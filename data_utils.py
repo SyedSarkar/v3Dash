@@ -489,7 +489,9 @@ def morning_briefing_df(df_week: pd.DataFrame) -> pd.DataFrame:
         "visit_status", "current_accumulative_absent_pct",
         "no_of_follow_up", "days_since_followup",
         "followup_status", "triage_segment",
-        "phone", "reason", "remarks",
+        "reason", "remarks",
+        "risk_category", "total_courses", "courses_at_risk", 
+        "course_attendance_summary", "phone"
     ]
     available = [c for c in display_cols if c in nr.columns]
     return (nr.sort_values(["_sort", "no_of_follow_up"], ascending=[True, False])

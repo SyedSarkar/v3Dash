@@ -95,7 +95,7 @@ def _kpi_card(label: str, value: int, color: str, key: str,
         """,
         unsafe_allow_html=True,
     )
-    return st.button("View students", key=key, use_container_width=True)
+    return st.button("View students", key=key, width='stretch')
 
 def _detail_table(df: pd.DataFrame, columns: Iterable[str] = DETAIL_COLUMNS,
                   filter_key: str = "risk"):
@@ -178,7 +178,7 @@ def _detail_table(df: pd.DataFrame, columns: Iterable[str] = DETAIL_COLUMNS,
                     if st.button(
                         btn_label,
                         key=f"risk_btn_{filter_key}_{k}",
-                        use_container_width=True
+                        width='stretch'
                     ):
 
                         updated = selected_risks.copy()
@@ -223,7 +223,7 @@ def _detail_table(df: pd.DataFrame, columns: Iterable[str] = DETAIL_COLUMNS,
 
     st.dataframe(
         styler,
-        use_container_width=True,
+        width='stretch',
         hide_index=True
     )
 
@@ -232,7 +232,7 @@ def _detail_table(df: pd.DataFrame, columns: Iterable[str] = DETAIL_COLUMNS,
         show.to_csv(index=False).encode("utf-8"),
         file_name="students.csv",
         mime="text/csv",
-        key=_ss_key("download", id(df)),
+        key=_ss_key("download", filter_key),
     )
 
 # ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ def _reasons_chart(
         margin=dict(l=10, r=10, t=50, b=10),
     )
 
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
     
 
 
@@ -336,7 +336,7 @@ def _render_risk_distribution(df_week: pd.DataFrame):
         }
     )
     fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def render_three_day_report(df: pd.DataFrame, week: int):
@@ -452,10 +452,10 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                                   margin-top:4px;">{n}</div>
                       <div style="color:#fed7aa;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
                       <div style="color:#ffedd5;font-size:0.78rem;margin-top:8px;line-height:1.4;">
-                        low_visit campus presence<br>+51% absent, multiple failed follow-ups
+                        Very low campus presence<br>+51% absent, multiple failed follow-ups
                       </div>
                       <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
-                        → Escalate; consider SDC
+                        → Contact on Whatsapp
                       </div>
                     </div>
                     """,
@@ -473,10 +473,10 @@ def render_three_day_report(df: pd.DataFrame, week: int):
                                   margin-top:4px;">{n}</div>
                       <div style="color:#ddd6fe;font-size:0.8rem;margin-top:2px;">{_pct(n)} of Not Responding</div>
                       <div style="color:#ede9fe;font-size:0.78rem;margin-top:8px;line-height:1.4;">
-                        Never visited campus at all<br>Family/financial/health barrier
+                        No Gate Entry Record<br>Not Responding
                       </div>
                       <div style="color:#fbbf24;font-size:0.75rem;font-weight:600;margin-top:6px;">
-                        → CSM/SFC
+                        → Escalate; consider SDC/ Contact on Whatsapp
                       </div>
                     </div>
                     """,
@@ -553,7 +553,7 @@ intervention.
                     margin=dict(l=10, r=10, t=40, b=10),
                     height=350,
                 )
-                st.plotly_chart(fig_donut, use_container_width=True)
+                st.plotly_chart(fig_donut, width='stretch')
             else:
                 st.info("No reason data available for Not Responding students.")
 
@@ -662,6 +662,7 @@ intervention.
                 "student_id":                    "ID",
                 "student_name":                  "Name",
                 "program":                       "Program",
+                "status":                        "Status",
                 "visit_status":                  "Campus Presence",
                 "current_accumulative_absent_pct": "Absence %",
                 "no_of_follow_up":               "Follow-ups Made",
@@ -671,6 +672,10 @@ intervention.
                 "phone":                         "Phone",
                 "reason":                        "Reason",
                 "remarks":                       "Remarks",
+                "risk_category":                 "Risk Category",
+                "courses_at_risk":               "Courses at Risk",
+                "total_courses":                 "Total Courses",
+                "course_attendance_summary":     "Course Attendance Summary"
             }
             show = filtered.rename(columns=rename_map)
             # round float columns that reach the screen
@@ -684,7 +689,7 @@ intervention.
             if "Absence %" in show.columns:
                 styler = styler.map(_absence_cell, subset=["Absence %"])
 
-            st.dataframe(styler, use_container_width=True, hide_index=True)
+            st.dataframe(styler, width='stretch', hide_index=True)
 
             st.download_button(
                 "⬇ Download morning briefing CSV",
@@ -818,7 +823,7 @@ def _render_dept_detail(df_week: pd.DataFrame, bucket: str, week: int):
             margin=dict(l=10, r=10, t=40, b=10),
             height=300,
         )
-        st.plotly_chart(fig_donut, use_container_width=True)
+        st.plotly_chart(fig_donut, width='stretch')
 
     with ch2:
         # reasons bar (same as CCD block but for this dept)
@@ -838,7 +843,7 @@ def _render_dept_detail(df_week: pd.DataFrame, bucket: str, week: int):
                 height=300, yaxis=dict(autorange="reversed"),
                 showlegend=False, margin=dict(l=10, r=10, t=40, b=10),
             )
-            st.plotly_chart(fig_r, use_container_width=True)
+            st.plotly_chart(fig_r, width='stretch')
         else:
             st.info("No reason data for this bucket.")
 
@@ -909,7 +914,7 @@ def _render_dept_detail(df_week: pd.DataFrame, bucket: str, week: int):
     if "risk_category" in show.columns:
         styler = styler.map(_risk_bg, subset=["risk_category"])
 
-    st.dataframe(styler, use_container_width=True, hide_index=True)
+    st.dataframe(styler, width='stretch', hide_index=True)
 
     st.download_button(
         f"⬇ Download {bucket} students CSV",
@@ -949,7 +954,7 @@ def _render_dept_detail(df_week: pd.DataFrame, bucket: str, week: int):
             legend=dict(orientation="h", y=-0.15),
             margin=dict(l=10, r=10, t=40, b=60),
         )
-        st.plotly_chart(fig_prog, use_container_width=True)
+        st.plotly_chart(fig_prog, width='stretch')
 
 
 # ---------------------------------------------------------------------------
@@ -1096,7 +1101,7 @@ def render_journey_report(df: pd.DataFrame):
         sty = tl_show.style
         if "risk_category" in tl_show.columns:
             sty = sty.map(_risk_bg, subset=["risk_category"])
-        st.dataframe(sty, use_container_width=True, hide_index=True)
+        st.dataframe(sty, width='stretch', hide_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1130,7 +1135,7 @@ def _render_journey_pivot(pivot: pd.DataFrame, weeks: list[int]):
         return f"background-color: {c}; color: white; font-weight: 600;"
 
     styled = show.style.map(_bg, subset=wk_cols)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    st.dataframe(styled, width='stretch', hide_index=True)
     st.download_button(
         "Download timeline CSV",
         show.to_csv(index=False).encode("utf-8"),
